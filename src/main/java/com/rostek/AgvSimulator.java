@@ -3,6 +3,7 @@ package com.rostek;
 import com.google.gson.*;
 import org.apache.log4j.LogManager;
 import org.apache.log4j.Logger;
+import org.eclipse.paho.client.mqttv3.*;
 
 import java.io.*;
 import java.net.ServerSocket;
@@ -13,22 +14,26 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-public class AgvSimulator extends Thread {
+public class AgvSimulator extends Thread implements MqttCallback {
 
     private static final Logger LOG = LogManager.getLogger(AgvSimulator.class);
 
-    private ServerSocket listener = null;
-    private Socket client;
-    private BufferedReader is;
-    private BufferedWriter os;
+    //socket
+//    private ServerSocket listener = null;
+//    private Socket client;
+
+    //mqtt
+    public static MqttAsyncClient myClient;
 
     private DataOutputStream dout;
     private DataInputStream din;
     private ScheduledExecutorService scheduler;
     private final Runnable stateTask;
-    private final Thread transportOrderExecutor;
+    private Thread transportOrderExecutor;
     private final LinkedList<String> todoList = new LinkedList<>();
     private final LinkedList<String> completedPoints = new LinkedList<>();
+
+    protected LinkedList<JsonObject> orderQueue = new LinkedList<>();
 
     private final Gson GSON = new Gson();
     private String position;
@@ -38,16 +43,15 @@ public class AgvSimulator extends Thread {
     public AgvSimulator(String initialPosition) {
         this.position = initialPosition;
         stateTask = () -> {
-            if (client != null && client.isConnected() && dout != null) {
-
-//        if (client != null && client.isConnected() && os != null) {
+            if (myClient != null && myClient.isConnected() ) {
+//            if (true) {
                 try {
-                    dout.writeUTF(createStateFeedback());
-                    dout.flush();
-//          os.write(createStateFeedback());
-//          os.flush();
-                } catch (IOException e) {
-                    e.printStackTrace();
+                    MqttMessage mqttMessage2 = new MqttMessage(createStateFeedback().getBytes());
+                    myClient.publish("myTopicPub", mqttMessage2.getPayload(), 0 , false);;
+                } catch (MqttPersistenceException e) {
+                    throw new RuntimeException(e);
+                } catch (MqttException e) {
+                    throw new RuntimeException(e);
                 }
             }
         };
@@ -63,24 +67,22 @@ public class AgvSimulator extends Thread {
             }
             LOG.info("Transport order #" + transportOrderCount + " was executed.");
         });
+
     }
 
-    public void open(int port) throws IOException {
-        listener = new ServerSocket(port);
-        LOG.info("Server opened in port " + port);
+    public void open() throws IOException, MqttException {
+        myClient = new MqttAsyncClient("tcp://localhost:1883", "myClient");
+        myClient.setCallback(this);
+
+        IMqttToken token = myClient.connect();
+        token.waitForCompletion();
+        LOG.info("Server opened...");
         this.start();
     }
 
-    public void close() {
+    public void close() throws MqttException {
         scheduler.shutdown();
-        try {
-            client.close();
-            listener.close();
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-        client = null;
-        listener = null;
+        myClient.disconnect();
     }
 
     public void setPosition(String position) {
@@ -94,68 +96,24 @@ public class AgvSimulator extends Thread {
 
     @Override
     public void run() {
-        while (true) {
+//        if (!orderQueue.isEmpty()){
+//            try {
+//                JsonObject to =
+//            }
+//        }
             try {
-                LOG.info("Waiting for client...");
-                client = listener.accept();
-
-                LOG.info("Client " + client.getRemoteSocketAddress() + " connected");
-                LOG.info("Initializing IO...");
-
-                din = new DataInputStream(client.getInputStream());
-                dout = new DataOutputStream(client.getOutputStream());
-
-                is = new BufferedReader(new InputStreamReader(client.getInputStream()));
-                os = new BufferedWriter(new OutputStreamWriter(client.getOutputStream()));
+                myClient.subscribe("myTopicSub", 0);
 
                 LOG.info("Creating state feedback interval task...");
                 scheduler = Executors.newScheduledThreadPool(1);
                 scheduler.scheduleAtFixedRate(stateTask, 1, 2000, TimeUnit.MILLISECONDS);
 
                 LOG.info("Ready for request!");
-                while (true) {
-                    String transportOrder = din.readUTF();
-                    try {
-                        if (transportOrder == null) {
-                            throw new IOException("Client disconnected");
-                        }
-                        if (Objects.equals(lastTransportOrder, transportOrder)) {
-                            LOG.info("Duplicated transport order, ignored.");
-                            continue;
-                        }
-                        JsonObject to = GSON.fromJson(transportOrder, JsonObject.class);
-                        if (processTransportOrder(to)) {
-                            LOG.info(MessageFormat.format("Executing transport order #{0} {1}",
-                                    ++transportOrderCount,
-                                    todoList));
-                            setLastTransportOrder(transportOrder);
-                        }
-                    } catch (JsonSyntaxException ex) {
-                        LOG.error("Invalid JSON: " + transportOrder);
-                        ex.printStackTrace();
-                    } catch (Exception ex) {
-                        LOG.error(MessageFormat.format("{0} when handle request: {1} at {2}",
-                                ex.getClass().getName(), ex.getMessage(), ex.getStackTrace()[0]));
-                    }
-                }
-            } catch (IOException e) {
-                scheduler.shutdown();
-                try {
-                    client.close();
-                } catch (IOException ioException) {
-                    ioException.printStackTrace();
-                }
-                is = null;
-                os = null;
-
-                din = null;
-                dout = null;
-
-                e.printStackTrace();
-                LOG.error("Caught exception, force close client.");
+            } catch (MqttException e) {
+                throw new RuntimeException(e);
             }
         }
-    }
+//    }
 
     private String createStateFeedback() {
         JsonObject feedback = new JsonObject();
@@ -183,7 +141,8 @@ public class AgvSimulator extends Thread {
         return feedback.toString() + "\n";
     }
 
-    boolean processTransportOrder(JsonObject to) {
+    boolean processTransportOrder(JsonObject to) throws InterruptedException {
+
         try {
             if (!to.has("cmd")) {
                 LOG.error("Transport order doesn't have element [cmd]");
@@ -221,9 +180,64 @@ public class AgvSimulator extends Thread {
                     ex.getStackTrace()[0].toString()));
             return false;
         }
-        ;
+
+        System.out.println( "State: "+ transportOrderExecutor.getState());
+        transportOrderExecutor = new Thread(() -> {
+            while (!todoList.isEmpty()) {
+                try {
+                    TimeUnit.SECONDS.sleep(5);
+                } catch (InterruptedException ignored) {
+                }
+                String destination = todoList.poll();
+                completedPoints.add(destination);
+                setPosition(destination);
+            }
+            LOG.info("Transport order #" + transportOrderCount + " was executed.");
+        });
         transportOrderExecutor.start();
 
         return true;
+    }
+
+    @Override
+    public void connectionLost(Throwable throwable) {
+
+    }
+
+    @Override
+    public void messageArrived(String s, MqttMessage mqttMessage) {
+            String transportOrder = mqttMessage.toString();
+            try {
+                if (transportOrder == null) {
+                    throw new IOException("Client disconnected");
+                }
+                if (Objects.equals(lastTransportOrder, transportOrder)) {
+                    LOG.info("Duplicated transport order, ignored.");
+//                    continue;
+                }
+                JsonObject to = GSON.fromJson(transportOrder, JsonObject.class);
+
+//                orderQueue.add(to);
+//
+//                System.out.println("Added transport order to queue");
+
+                if (processTransportOrder(to)) {
+                    LOG.info(MessageFormat.format("Executing transport order #{0} {1}",
+                            ++transportOrderCount,
+                            todoList));
+                    setLastTransportOrder(transportOrder);
+                }
+            } catch (JsonSyntaxException ex) {
+                LOG.error("Invalid JSON: " + transportOrder);
+            } catch (Exception ex) {
+                LOG.error(MessageFormat.format("{0} when handle request: {1} at {2}",
+                        ex.getClass().getName(), ex.getMessage(), ex.getStackTrace()[0]));
+            }
+        }
+//    }
+
+    @Override
+    public void deliveryComplete(IMqttDeliveryToken iMqttDeliveryToken) {
+
     }
 }
